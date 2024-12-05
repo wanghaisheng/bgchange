@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import Replicate from 'replicate';
 import { Slug } from '@/types';
 import { Configurations } from "@/types";
-import { configurations } from '@/common/configuration';
+import {getConfigurations} from '@/common/configuration';
 import { Client, handle_file } from "@gradio/client";
 
 type Status = "successful" | "failed" | "canceled";
@@ -14,23 +14,49 @@ export async function POST(
   request: Request,
   { params }: { params: { slug: Slug } },
 ) {
-  
   const slug = params.slug;
 
-  // return NextResponse.json(
-  //   { status: 201 }
-  // );
+  console.log('Received request for slug:', slug);
 
   try {
+    const configurations = await getConfigurations(true);
 
-    if (slug  === 'EVF-SAM' && configurations[slug]) {
+    if (!configurations) {
+      console.error('No configurations found');
+      return NextResponse.json(
+        { error: 'No configurations available' },
+        { status: 404 }
+      );
+    }
+
+    console.log('Fetched configurations:', configurations.map(conf => conf.name));
+
+    const config = configurations.find(conf => conf.name === slug);
+
+    if (!config) {
+      console.error(`Configuration not found for slug: ${slug}`);
+      return NextResponse.json(
+        { error: `Configuration not found for slug: ${slug}` },
+        { status: 404 }
+      );
+    }
+
+    console.log('Found configuration:', config.name);
+
+    const evfSamConfig = configurations.find(conf => conf.name === 'EVF-SAM');
+
+    if (slug === 'EVF-SAM' && evfSamConfig) {
+      const conf = configurations.find(conf => conf.name === 'EVF-SAM');
       console.log('flag1');
-      const config = configurations[slug];
+      const config = configurations.find(conf => conf.name === 'EVF-SAM');
       const formData = await request.formData();
       console.log('flag1.1');
 
-      const image = formData.get(configurations['EVF-SAM'].inputs[0].key) as File | null;
-      const prompt = formData.get(configurations['EVF-SAM'].inputs[1].key) as String | null;
+      if (!conf) {
+        throw new Error("Configuration not found for the specified slug.");
+      }
+      const image = formData.get(conf.inputs[0].key) as File | null;
+      const prompt = formData.get(conf.inputs[1].key) as String | null;
 
       console.log('flag1.2', {image, prompt});
 
@@ -41,6 +67,9 @@ export async function POST(
         );
       }
 
+      if (!config) {
+        throw new Error("Configuration not found for the specified slug.");
+      }
       
       const imageBuffer = await image.arrayBuffer();
       console.log('flag2', config.client, config.path);
@@ -65,13 +94,13 @@ export async function POST(
         output.data,
         { status: 201 }
       );
-    } else if(configurations[slug]) {
+    } else if (config) {
       const req = await request.json();
-      const config = configurations[slug];
+      console.log('elseif conf');
 
       let indImg = 0;
 
-      if (config.type === 'replicate') {
+      if (config && config.type === 'replicate') {
         const replicate = new Replicate({
           auth: REPLICATE_API_TOKEN,
         });
@@ -79,9 +108,9 @@ export async function POST(
         const model: 
           `${string}/${string}` | `${string}/${string}:${string}` | undefined = config.model;
 
-        if(!model || typeof model !== "string") throw Error(`not model found or format issue ${model}`);
+        if (!model || typeof model !== "string") throw Error(`not model found or format issue ${model}`);
 
-        const version: string | undefined = config.version;
+        const version = config.version as string | undefined;
 
         // I need to check how to convert array of object, to object,
 
@@ -89,12 +118,14 @@ export async function POST(
         
         // TODO -> Make the extraction of the req automatic, define in the fronted, the name related with the config object ...
 
+        // console.log('Request Parameters:', JSON.stringify(req, null, 2));
+
         let indxImage = 0;
         config.inputs.forEach(item => {
           if (item.key) {
             if(item.show) {
-              const {type} = item;
-              if (type === 'image') {
+              const {component} = item;
+              if (component === 'image') {
                 const {image} = req;
                 if(!image) return NextResponse.json(
                   { error: 'not image /api' },
@@ -102,7 +133,7 @@ export async function POST(
                 );
                 console.log({image})
                 input[item.key] = image[indxImage];
-              } else if (type === 'prompt') {
+              } else if (component === 'prompt') {
                 const {prompt} = req;
                 if(!prompt) return NextResponse.json(
                   { error: 'not image /api' },
@@ -119,21 +150,22 @@ export async function POST(
         if(!input) throw Error('api/app/[]/ input is not a object');
 
         console.log('xxx ->', {model, version , input});
-        const output = await replicate.predictions.create({
-          model,
-          version,
-          input,
-        });
+        
+        // const output = await replicate.predictions.create({
+        //   model,
+        //   version,
+        //   input,
+        // });
 
-        // const output = {
-        //   id: "nbjvdfmzwdrgg0ch1tn8dee3j8"
-        // };
+        const output = {
+          id: "3h1s8zajrxrgp0chr93t8h6svg"
+        };
         
         if (!output) {
           console.log(`api/[${slug}] !output`, {output});
           console.log('Something went wrong');
           return NextResponse.json(
-            { error: 'Something went wrong' },
+            { error: 'Something went wrong, api not response output' },
             { status: 500 }
           );
         }
@@ -142,23 +174,38 @@ export async function POST(
           output,
           { status: 201 }
         );
-      } else if (config.type === 'gradio') {
-        const params = config.inputs.map(item => {
-          if(item.show) {
-            if(item.type === 'image') {
-              const newImg = req.image[indImg];
-              indImg++;
-              return newImg;
-            } else if (item.type === 'prompt') {
-              return req.prompt;
-            } else {
-              return item.value;
-            }
-          }
-        });
-        const app = await Client.connect(config.client as string);
-        const output = await app.predict("/tryon", params)
+      } else if (config && config.type === 'gradio') {
+        const params: Record<string, any> = {};
+        let indImg = 0;
 
+        for (const item of config.inputs) {
+          if (item.component === 'image') {
+            const image = req.image[indImg];
+            if (typeof image === 'string' && image.startsWith('data:image/')) {
+              params[item.key] = await handle_file(await convertBase64ToBlob(image));
+            } else {
+              params[item.key] = await handle_file(image);
+            }
+            indImg++;
+          } else {
+            params[item.key] = req[item.key] !== undefined ? req[item.key] : item.value;
+          }
+        }
+        const client = config.client;
+        const path = config.path;
+        console.log(JSON.stringify(config, null, 2));
+        console.log({client, path, params})
+        let output: any;
+        try {
+          const app = await Client.connect(client as string);
+          console.log('flag 1 - gradio client', {app})
+          output = await app.predict(path as string, params);
+          console.log('flag 1 - gradio predict')
+        } catch (error: any) {
+          throw Error('gradio predict error', error.message);
+        }
+        
+        
         console.log({output});
         if (!output) {
           console.log('Something went wrong');
@@ -172,17 +219,15 @@ export async function POST(
           output.data,
           { status: 201 }
         );
-
-        
       }
-    } else {
-      if(slug !== 'freshink' 
+    } else if (slug !== 'freshink' 
         && slug !== 'createVideo'
         && slug !== "hairStyle"
         && slug !== "livePortrait"
         && slug !== "upscaler"
-        && slug !== 'tryon'
-      ) return NextResponse.json(
+        && slug !== 'tryon')
+    {
+      return NextResponse.json(
         { error: `Something went wrong, api, slug ${slug} not found` },
         { status: 500 }
       );
@@ -234,7 +279,10 @@ export async function POST(
     if(!input) throw Error('api/app/[]/ input is not a object');
 
     console.log('xxx ->', {model, version , input});
+
+
     const output = await replicate.predictions.create({
+      model,
       version,
       input,
     });
@@ -258,7 +306,8 @@ export async function POST(
       { status: 201 }
     );
   } catch (error: any) {
-    console.error("api/app/[] err" + JSON.stringify(error, null, 2));
+    console.log({error});
+    console.error("api/app/[] general error" + JSON.stringify(error.message, null, 2));
     return NextResponse.json(
       { error: error.message },
       { status: 500 }
@@ -384,4 +433,9 @@ function getModel({slug}: {slug: string}) {
   }
 
   return {sheme};
+}
+
+async function convertBase64ToBlob(base64: string): Promise<Blob> {
+  const response = await fetch(base64);
+  return await response.blob();
 }
